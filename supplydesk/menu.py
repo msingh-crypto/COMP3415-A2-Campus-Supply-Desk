@@ -38,7 +38,7 @@ def read_request(service):
             print("Please enter a whole number. Re-enter this item.")
             continue
         items.append({"product_id": product_id, "quantity": quantity})
-    fulfillment = input("Fulfillment [pickup/delivery] (Enter = pickup): ").strip() or "pickup"
+    fulfillment = input("Fulfillment [pickup/delivery/express] (Enter = pickup): ").strip() or "pickup"
     return customer, items, fulfillment
 
 
@@ -87,3 +87,4 @@ def run_menu(service):
         except (ValueError, OSError, KeyError, TypeError) as error:
             print(f"Error: {error}")
             print("Returning to the menu. Check your input or state file before retrying.")
+            

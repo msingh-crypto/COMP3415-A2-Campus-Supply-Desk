@@ -180,6 +180,7 @@ Use repeated `--item` options for multiple items:
 python -m supplydesk quote --customer student --item hoodie:1 --item mug:1
 ```
 
+
 ### Place, inspect, and cancel an order
 
 ```sh

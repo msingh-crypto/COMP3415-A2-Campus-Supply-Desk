@@ -1,9 +1,15 @@
 """Automated test suite for the Campus Supply Desk order service."""
 
+import contextlib
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+from supplydesk.cli import main as cli_main
+from supplydesk.menu import read_request
 from supplydesk.service import OrderService
 
 
@@ -78,21 +84,18 @@ class OrderSmokeTests(unittest.TestCase):
     # --- Category 2: Boundary Behavior ---
 
     def test_student_discount_at_exact_5000_cents_boundary(self):
-        # 10 notebooks = 5000 cents ($50.00). Spec states student gets 10% at >= 5000 cents.
         quote = self.service.quote("student", [{"product_id": "notebook", "quantity": 10}])
         self.assertEqual(quote["subtotal_cents"], 5000)
         self.assertEqual(quote["discount_cents"], 500)
         self.assertEqual(quote["total_cents"], 4500)
 
     def test_student_no_discount_just_below_5000_cents_boundary(self):
-        # 6 pen-packs = 4500 cents (< 5000 cents). No discount should apply.
         quote = self.service.quote("student", [{"product_id": "pen-pack", "quantity": 6}])
         self.assertEqual(quote["subtotal_cents"], 4500)
         self.assertEqual(quote["discount_cents"], 0)
         self.assertEqual(quote["total_cents"], 4500)
 
     def test_free_delivery_at_exact_10000_post_discount_boundary(self):
-        # Regular customer: 2 hoodies + 4 notebooks = 8000 + 2000 = 10000 cents exactly.
         quote = self.service.quote(
             "regular",
             [{"product_id": "hoodie", "quantity": 2}, {"product_id": "notebook", "quantity": 4}],
@@ -102,7 +105,6 @@ class OrderSmokeTests(unittest.TestCase):
         self.assertEqual(quote["delivery_cents"], 0)
         self.assertEqual(quote["total_cents"], 10000)
 
-        # Student customer: 10000 subtotal - 1000 discount = 9000 (< 10000), so delivery is 600.
         student_quote = self.service.quote(
             "student",
             [{"product_id": "hoodie", "quantity": 2}, {"product_id": "notebook", "quantity": 4}],
@@ -114,7 +116,6 @@ class OrderSmokeTests(unittest.TestCase):
         self.assertEqual(student_quote["total_cents"], 9600)
 
     def test_ordering_exact_available_stock_succeeds_and_reaches_zero(self):
-        # Canvas bag initial stock is 4.
         order = self.service.place_order("regular", [{"product_id": "bag", "quantity": 4}])
         self.assertEqual(order["subtotal_cents"], 10000)
         stock_by_id = {item["product_id"]: item["stock"] for item in self.service.catalog()}
@@ -143,7 +144,6 @@ class OrderSmokeTests(unittest.TestCase):
                     self.service.quote("regular", [{"product_id": "notebook", "quantity": bad_qty}])
 
     def test_duplicate_product_lines_exceeding_combined_stock_raises_value_error(self):
-        # Canvas bag has initial stock of 4. Two lines of 3 = 6 total (> 4).
         with self.assertRaises(ValueError):
             self.service.place_order(
                 "regular",
@@ -164,7 +164,6 @@ class OrderSmokeTests(unittest.TestCase):
     def test_quote_does_not_create_save_file_or_mutate_stock(self):
         quote = self.service.quote("student", [{"product_id": "hoodie", "quantity": 2}], "delivery")
         order = self.service.place_order("student", [{"product_id": "hoodie", "quantity": 2}], "delivery")
-        # Pricing and items must match identically between quote and order
         for key in ("customer_type", "fulfillment", "items", "subtotal_cents",
                     "discount_cents", "delivery_cents", "total_cents"):
             self.assertEqual(quote[key], order[key])
@@ -174,7 +173,6 @@ class OrderSmokeTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_cancelling_already_cancelled_order_is_idempotent(self):
-        # Initial mug stock is 8.
         order = self.service.place_order("regular", [{"product_id": "mug", "quantity": 3}])
         first_cancel = self.service.cancel_order(order["order_id"])
         second_cancel = self.service.cancel_order(order["order_id"])
@@ -183,6 +181,69 @@ class OrderSmokeTests(unittest.TestCase):
         self.assertEqual(second_cancel["status"], "cancelled")
         stock_by_id = {item["product_id"]: item["stock"] for item in self.service.catalog()}
         self.assertEqual(stock_by_id["mug"], 8)
+
+    # --- CR-01: Express Delivery Tests ---
+
+    def test_regular_express_quote_adds_1200_cents(self):
+        quote = self.service.quote("regular", [{"product_id": "notebook", "quantity": 2}], "express")
+        self.assertEqual(quote["fulfillment"], "express")
+        self.assertEqual(quote["subtotal_cents"], 1000)
+        self.assertEqual(quote["discount_cents"], 0)
+        self.assertEqual(quote["delivery_cents"], 1200)
+        self.assertEqual(quote["total_cents"], 2200)
+
+    def test_student_express_quote_discounts_merchandise_only(self):
+        quote = self.service.quote("student", [{"product_id": "hoodie", "quantity": 2}], "express")
+        self.assertEqual(quote["subtotal_cents"], 8000)
+        self.assertEqual(quote["discount_cents"], 800)
+        self.assertEqual(quote["delivery_cents"], 1200)
+        self.assertEqual(quote["total_cents"], 8400)
+
+    def test_express_fee_is_never_waived_above_free_delivery_threshold(self):
+        standard = self.service.quote("regular", [{"product_id": "hoodie", "quantity": 3}], "delivery")
+        express = self.service.quote("regular", [{"product_id": "hoodie", "quantity": 3}], "express")
+        self.assertEqual(standard["delivery_cents"], 0)
+        self.assertEqual(standard["total_cents"], 12000)
+        self.assertEqual(express["delivery_cents"], 1200)
+        self.assertEqual(express["total_cents"], 13200)
+
+    def test_express_order_agrees_with_quote_persists_and_cancels(self):
+        items = [{"product_id": "hoodie", "quantity": 2}]
+        quote = self.service.quote("student", items, "express")
+        order = self.service.place_order("student", items, "express")
+        for key in ("customer_type", "fulfillment", "items", "subtotal_cents",
+                    "discount_cents", "delivery_cents", "total_cents"):
+            self.assertEqual(quote[key], order[key])
+
+        reopened = OrderService(self.path).get_order(order["order_id"])
+        self.assertEqual(reopened["fulfillment"], "express")
+        self.assertEqual(reopened["delivery_cents"], 1200)
+        self.assertEqual(reopened["total_cents"], 8400)
+
+        cancelled = self.service.cancel_order(order["order_id"])
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["fulfillment"], "express")
+        self.assertEqual(cancelled["delivery_cents"], 1200)
+        self.assertEqual(cancelled["total_cents"], 8400)
+
+    def test_cli_and_menu_support_express_fulfillment(self):
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            exit_code = cli_main([
+                "--data", str(self.path),
+                "quote", "--customer", "student", "--fulfillment", "express", "--item", "hoodie:2",
+            ])
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout_buffer.getvalue())
+        self.assertEqual(payload["fulfillment"], "express")
+        self.assertEqual(payload["delivery_cents"], 1200)
+        self.assertEqual(payload["total_cents"], 8400)
+
+        with patch("builtins.input", side_effect=["regular", "notebook", "2", "", "express"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            customer, items, fulfillment = read_request(self.service)
+        self.assertEqual((customer, items, fulfillment),
+                         ("regular", [{"product_id": "notebook", "quantity": 2}], "express"))
 
 
 if __name__ == "__main__":
